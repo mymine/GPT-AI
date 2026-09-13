@@ -14,8 +14,8 @@
  */
 
 const express = require('express');
-const axios = require('axios');
 const { randomUUID } = require('crypto');
+const { invoke } = require('./invoke');
 const { PROVIDERS, normalizeModel, DEFAULT_PROVIDER } = require('./providers');
 
 const router = express.Router();
@@ -29,10 +29,38 @@ function toInt(value, fallback) {
   return Number.isFinite(n) && n >= 0 ? n : fallback;
 }
 
-/** Base URL the gateway uses to reach the local `/chat/vN` routes. */
-function selfBaseUrl() {
-  if (process.env.SELF_BASE_URL) return process.env.SELF_BASE_URL.replace(/\/+$/, '');
-  return `http://127.0.0.1:${process.env.PORT || 3000}`;
+// Statically reference every scraper router so the serverless bundler
+// (@vercel/nft) always includes them — a dynamic require(`./scrapers/${id}`)
+// would not be traced and would fail at runtime on Vercel.
+const SCRAPER_ROUTERS = {
+  v1: require('./scrapers/v1'),
+  v2: require('./scrapers/v2'),
+  v3: require('./scrapers/v3'),
+  v4: require('./scrapers/v4'),
+  v5: require('./scrapers/v5'),
+  v6: require('./scrapers/v6'),
+  v7: require('./scrapers/v7'),
+  v8: require('./scrapers/v8'),
+  v9: require('./scrapers/v9'),
+  v10: require('./scrapers/v10'),
+  v11: require('./scrapers/v11'),
+  v12: require('./scrapers/v12'),
+  v13: require('./scrapers/v13'),
+  v14: require('./scrapers/v14'),
+  v15: require('./scrapers/v15'),
+};
+
+function scraperFor(providerId) {
+  return SCRAPER_ROUTERS[providerId];
+}
+
+function withTimeout(promise, ms, message) {
+  if (!ms || ms <= 0) return promise;
+  let timer;
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(message)), ms); }),
+  ]).finally(() => clearTimeout(timer));
 }
 
 function contentToText(content) {
@@ -185,21 +213,23 @@ router.post('/chat/completions', async (req, res) => {
   }
 
   const payload = buildPayload(provider, body);
-  const headers = { 'Content-Type': 'application/json' };
+  const headers = {};
   if (req.headers.authorization) headers.Authorization = req.headers.authorization;
 
   let reply;
   try {
-    const upstream = await axios.post(`${selfBaseUrl()}/chat/${providerId}`, payload, {
-      headers,
-      timeout: UPSTREAM_TIMEOUT,
-      validateStatus: () => true,
-      maxBodyLength: Infinity,
-    });
-    const data = upstream.data;
-    if (upstream.status >= 400 || !data || data.reply === undefined || data.reply === null) {
+    // Invoke the scraper router in-process — no HTTP hop, no bound port. This
+    // is what makes the gateway work on serverless platforms (e.g. Vercel),
+    // where nothing is ever listening on 127.0.0.1.
+    const result = await withTimeout(
+      invoke(scraperFor(providerId), { method: 'POST', url: '/', headers, body: payload }),
+      UPSTREAM_TIMEOUT,
+      `provider '${providerId}' timed out after ${UPSTREAM_TIMEOUT}ms`
+    );
+    const data = result.body;
+    if (result.statusCode >= 400 || !data || data.reply === undefined || data.reply === null) {
       const raw = data && (data.details || data.error);
-      const msg = raw ? (typeof raw === 'string' ? raw : JSON.stringify(raw)) : `upstream status ${upstream.status}`;
+      const msg = raw ? (typeof raw === 'string' ? raw : JSON.stringify(raw)) : `upstream status ${result.statusCode}`;
       throw new Error(msg);
     }
     reply = typeof data.reply === 'string' ? data.reply : String(data.reply);

@@ -212,7 +212,6 @@ console.log(resp.choices[0].message.content);
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
 | `PORT` | 服务监听端口 | `3000` |
-| `SELF_BASE_URL` | 适配层调用本地 `/chat/vN` 的基地址 | `http://127.0.0.1:<PORT>` |
 | `OPENAI_COMPAT_KEY` | 若设置，则 `/v1/*` 需携带 `Authorization: Bearer <key>` | 空（不校验） |
 | `DEFAULT_PROVIDER` | 无法识别 `model` 时使用的后端 | `v1` |
 | `UPSTREAM_TIMEOUT_MS` | 上游请求超时（毫秒） | `120000` |
