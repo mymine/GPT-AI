@@ -10,6 +10,7 @@
 - [接口二：OpenAI 兼容接口 `/v1`](#-接口二openai-兼容接口-v1)
 - [可用端点](#-可用端点)
 - [环境变量](#-环境变量)
+- [部署到 Vercel](#-部署到-vercel)
 - [技术栈](#-技术栈)
 - [参与贡献](#-参与贡献)
 - [许可](#-许可)
@@ -220,6 +221,34 @@ console.log(resp.choices[0].message.content);
 | `OPENROUTER_API_KEY` | `/chat/v2` 的 Key | — |
 | `FREEDOMGPT_API_KEY` | `/chat/v7` 的 Key | — |
 | `AIRFORCE_API_KEY` | `/chat/v12` 的 Key | — |
+
+## ☁️ 部署到 Vercel
+
+项目已内置 Serverless 适配，可直接导入 Vercel 部署：
+
+- `api/index.js` —— 函数入口，重新导出根目录的 Express 应用（`index.js`）。Vercel 零配置会把 `api/` 下的文件识别为函数。
+- `vercel.json` —— 将所有路径改写（rewrite）到该函数，并把函数最大执行时长设为 60 秒。
+
+```json
+{
+  "functions": { "api/index.js": { "maxDuration": 60 } },
+  "rewrites": [{ "source": "/(.*)", "destination": "/api/index.js" }]
+}
+```
+
+部署步骤：
+
+```bash
+npm i -g vercel
+vercel --prod          # 按提示导入项目即可
+```
+
+注意事项：
+
+- **无本地端口**：适配层在进程内直接调用 `/chat/vN` 处理函数，不经过 HTTP、不占用端口，因此在 Serverless 上不会出现 `ECONNREFUSED 127.0.0.1`。
+- **执行时长**：`maxDuration` 已设为 `60` 秒（Hobby 计划可用的稳妥上限）；Pro 计划可调高到 `300` 乃至更多，仅当第三方后端响应较慢时才需要调整。
+- **上游 Key**：需要 Key 的后端（v1/v2/v7/v12）请在 Vercel 项目 → Settings → Environment Variables 中配置对应变量。
+- **出口 IP**：Vercel 使用共享出口 IP，部分第三方站点可能限流或需要 Key。
 
 ## 🛠️ 技术栈
 
