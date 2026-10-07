@@ -6,17 +6,28 @@
  * Exposes:
  *   GET  /v1/models              -> list the available providers
  *   GET  /v1/models/:id          -> single provider
- *   POST /v1/chat/completions    -> OpenAI Chat Completions (streaming + non-streaming)
+ *   POST /v1/chat/completions    -> OpenAI Chat Completions (streaming + non-streaming + tools)
  *
- * Requests are translated into the project's own `/chat/vN` scraper routes
- * (called over localhost) and the `{ reply }` response is wrapped back into an
- * OpenAI-style payload, so any OpenAI SDK / client works out of the box.
+ * Requests are translated into the project's own `/chat/vN` scraper routes and
+ * the `{ reply }` response is wrapped back into an OpenAI-style payload. Tool
+ * calling (OpenAI `tools` / `tool_calls`) is supported for **every** provider:
+ * since most backends have no native function-calling API, the gateway injects
+ * a tools instruction into the prompt and parses the model's JSON reply back
+ * into a standard `tool_calls` array. Execution of the tool is done by the
+ * client — the gateway only carries the call back and forth.
  */
 
 const express = require('express');
 const { randomUUID } = require('crypto');
 const { invoke } = require('./invoke');
 const { PROVIDERS, normalizeModel, DEFAULT_PROVIDER } = require('./providers');
+const {
+  contentToText,
+  buildToolsInstruction,
+  normalizeMessages,
+  flattenMessages,
+  parseReply,
+} = require('./tools');
 
 const router = express.Router();
 
@@ -63,58 +74,20 @@ function withTimeout(promise, ms, message) {
   ]).finally(() => clearTimeout(timer));
 }
 
-function contentToText(content) {
-  if (content === null || content === undefined) return '';
-  if (typeof content === 'string') return content;
-  if (Array.isArray(content)) {
-    return content.map(part => {
-      if (typeof part === 'string') return part;
-      if (part && typeof part === 'object') return part.text || part.content || '';
-      return '';
-    }).join('');
-  }
-  if (typeof content === 'object') return content.text || JSON.stringify(content);
-  return String(content);
-}
-
-function normalizeMessage(m) {
-  const role = ['system', 'user', 'assistant', 'developer', 'tool'].includes(m && m.role) ? m.role : 'user';
-  return { role, content: contentToText(m && m.content) };
-}
-
-/** Collapse an OpenAI message array into a single prompt string. */
-function flattenMessages(messages) {
-  const list = (messages || [])
-    .map(m => ({ role: m && m.role, text: contentToText(m && m.content) }))
-    .filter(m => m.text.trim() !== '');
-  if (list.length === 0) return '';
-  if (list.length === 1 && list[0].role !== 'system') return list[0].text.trim();
-
-  const systems = list.filter(m => m.role === 'system').map(m => m.text.trim());
-  const turns = list
-    .filter(m => m.role !== 'system')
-    .map(m => `${m.role === 'assistant' ? 'Assistant' : 'User'}: ${m.text.trim()}`);
-
-  let out = '';
-  if (systems.length) out += systems.join('\n') + '\n\n';
-  out += turns.join('\n');
-  return out.trim();
-}
-
 const PASSTHROUGH = [
   'temperature', 'top_p', 'max_tokens', 'max_completion_tokens',
   'presence_penalty', 'frequency_penalty', 'stop', 'seed', 'reasoning_effort',
 ];
 
 /** Build the payload forwarded to the `/chat/vN` scraper. */
-function buildPayload(provider, body) {
+function buildPayload(provider, body, toolsInstruction) {
   const messages = Array.isArray(body.messages) ? body.messages : [];
   const payload = {};
 
   if (provider.mode === 'messages') {
-    payload.messages = messages.map(normalizeMessage);
+    payload.messages = normalizeMessages(messages, toolsInstruction);
   } else {
-    payload.userMessage = flattenMessages(messages);
+    payload.userMessage = flattenMessages(messages, toolsInstruction);
   }
   if (provider.sendModel && provider.model) payload.model = provider.model;
 
@@ -124,10 +97,12 @@ function buildPayload(provider, body) {
   return payload;
 }
 
-function estimateUsage(messages, reply) {
-  const promptText = (messages || []).map(m => contentToText(m && m.content)).join(' ');
+function estimateUsage(messages, output) {
+  const promptText = (messages || [])
+    .map(m => contentToText(m && m.content) + (m && m.tool_calls ? JSON.stringify(m.tool_calls) : ''))
+    .join(' ');
   const promptTokens = Math.max(1, Math.ceil(promptText.length / 4));
-  const completionTokens = Math.max(1, Math.ceil(String(reply || '').length / 4));
+  const completionTokens = Math.max(1, Math.ceil(String(output || '').length / 4));
   return {
     prompt_tokens: promptTokens,
     completion_tokens: completionTokens,
@@ -172,6 +147,7 @@ function modelListEntry(id, provider) {
       upstream_model: provider.model || null,
       mode: provider.mode,
       requires_key: Boolean(provider.envKey),
+      supports_tools: true,
     },
   };
 }
@@ -212,7 +188,13 @@ router.post('/chat/completions', async (req, res) => {
     return sendError(res, 404, `The model \`${requested}\` does not exist.`, 'model_not_found');
   }
 
-  const payload = buildPayload(provider, body);
+  // ---- tool calling (works for every provider via prompt injection) ----
+  const tools = Array.isArray(body.tools) && body.tools.length > 0 ? body.tools : null;
+  const toolChoice = body.tool_choice;
+  const useTools = Boolean(tools) && toolChoice !== 'none';
+  const toolsInstruction = useTools ? buildToolsInstruction(tools, toolChoice) : null;
+
+  const payload = buildPayload(provider, body, toolsInstruction);
   const headers = {};
   if (req.headers.authorization) headers.Authorization = req.headers.authorization;
 
@@ -242,18 +224,28 @@ router.post('/chat/completions', async (req, res) => {
     );
   }
 
+  const parsed = useTools ? parseReply(reply) : { content: reply, toolCalls: null };
+
   const id = 'chatcmpl-' + randomUUID().replace(/-/g, '');
   const created = Math.floor(Date.now() / 1000);
+  const streaming = body.stream === true || body.stream === 'true';
+  const outputForUsage = parsed.toolCalls ? JSON.stringify(parsed.toolCalls) : parsed.content;
 
-  if (body.stream === true || body.stream === 'true') {
+  if (streaming) {
     return sendStream(req, res, {
       id,
       created,
       model: providerId,
-      reply,
+      content: parsed.content,
+      toolCalls: parsed.toolCalls,
       includeUsage: Boolean(body.stream_options && body.stream_options.include_usage),
+      usage: estimateUsage(body.messages, outputForUsage),
     });
   }
+
+  const message = parsed.toolCalls
+    ? { role: 'assistant', content: parsed.content || null, tool_calls: parsed.toolCalls }
+    : { role: 'assistant', content: parsed.content };
 
   res.json({
     id,
@@ -261,14 +253,18 @@ router.post('/chat/completions', async (req, res) => {
     created,
     model: providerId,
     choices: [
-      { index: 0, message: { role: 'assistant', content: reply }, finish_reason: 'stop' },
+      {
+        index: 0,
+        message,
+        finish_reason: parsed.toolCalls ? 'tool_calls' : 'stop',
+      },
     ],
-    usage: estimateUsage(body.messages, reply),
+    usage: estimateUsage(body.messages, outputForUsage),
   });
 });
 
-/** Stream `reply` back to the client as OpenAI chat.completion.chunk events. */
-function sendStream(req, res, { id, created, model, reply, includeUsage }) {
+/** Stream `content` or `toolCalls` as OpenAI chat.completion.chunk events. */
+function sendStream(req, res, { id, created, model, content, toolCalls, includeUsage, usage }) {
   let closed = false;
   req.on('close', () => { closed = true; });
 
@@ -282,27 +278,66 @@ function sendStream(req, res, { id, created, model, reply, includeUsage }) {
   const base = { id, object: 'chat.completion.chunk', created, model };
   const write = (choices) => res.write(`data: ${JSON.stringify({ ...base, choices })}\n\n`);
 
-  write([{ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null }]);
-
-  const chunks = splitIntoChunks(reply);
+  const frames = buildStreamFrames(content, toolCalls);
   let i = 0;
 
   const tick = () => {
     if (closed) return;
-    if (i >= chunks.length) {
-      write([{ index: 0, delta: {}, finish_reason: 'stop' }]);
+    if (i >= frames.length) {
       if (includeUsage) {
-        res.write(`data: ${JSON.stringify({ ...base, choices: [], usage: estimateUsage([], reply) })}\n\n`);
+        res.write(`data: ${JSON.stringify({ ...base, choices: [], usage: usage || estimateUsage([], content || '') })}\n\n`);
       }
       res.write('data: [DONE]\n\n');
       return res.end();
     }
-    write([{ index: 0, delta: { content: chunks[i++] }, finish_reason: null }]);
+    write([frames[i++]]);
     if (STREAM_DELAY_MS > 0) setTimeout(tick, STREAM_DELAY_MS);
     else setImmediate(tick);
   };
 
   tick();
+}
+
+/** Build the ordered list of streamed choice deltas (content or tool_calls). */
+function buildStreamFrames(content, toolCalls) {
+  const frames = [];
+
+  if (toolCalls && toolCalls.length > 0) {
+    frames.push({
+      index: 0,
+      delta: {
+        role: 'assistant',
+        content: null,
+        tool_calls: toolCalls.map((tc, idx) => ({
+          index: idx,
+          id: tc.id,
+          type: 'function',
+          function: { name: tc.function.name, arguments: '' },
+        })),
+      },
+      finish_reason: null,
+    });
+
+    toolCalls.forEach((tc, idx) => {
+      for (const chunk of splitIntoChunks(tc.function.arguments, 8, 24)) {
+        frames.push({
+          index: 0,
+          delta: { tool_calls: [{ index: idx, function: { arguments: chunk } }] },
+          finish_reason: null,
+        });
+      }
+    });
+
+    frames.push({ index: 0, delta: {}, finish_reason: 'tool_calls' });
+    return frames;
+  }
+
+  frames.push({ index: 0, delta: { role: 'assistant', content: '' }, finish_reason: null });
+  for (const chunk of splitIntoChunks(content)) {
+    frames.push({ index: 0, delta: { content: chunk }, finish_reason: null });
+  }
+  frames.push({ index: 0, delta: {}, finish_reason: 'stop' });
+  return frames;
 }
 
 module.exports = router;

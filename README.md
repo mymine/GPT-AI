@@ -8,6 +8,7 @@
 - [快速开始](#-快速开始)
 - [接口一：原生接口 `/chat/vN`](#-接口一原生接口-chatvn)
 - [接口二：OpenAI 兼容接口 `/v1`](#-接口二openai-兼容接口-v1)
+- [Function Calling（工具调用）](#-function-calling工具调用)
 - [可用端点](#-可用端点)
 - [环境变量](#-环境变量)
 - [部署到 Vercel](#-部署到-vercel)
@@ -183,6 +184,103 @@ console.log(resp.choices[0].message.content);
 
 - 原生 `/chat/vN` 只返回 `{ "reply": "..." }`；`/v1` 会补全为完整的 OpenAI 响应结构。
 - 只接受单条 `userMessage` 的后端（v4/v5/v8/v9/v11/v13/v14/v15）会由适配层把整个 `messages` 对话历史折叠为一条提示词后转发。
+
+## 🧩 Function Calling（工具调用）
+
+网关支持完整的 OpenAI function calling 往返，且**对全部 v1~v15 后端生效**：
+
+1. 客户端在请求中带 `tools`（及可选 `tool_choice`）；
+2. 模型决定调用时，接口返回标准 `tool_calls` 结构（`finish_reason: "tool_calls"`）；
+3. 客户端执行工具后，把结果作为 `role: "tool"` 的消息回传，继续下一轮。
+
+由于 v3~v15 的上游是普通网页聊天后端、没有原生工具 API，网关会在**提示词层注入工具说明**并要求模型以 JSON 输出调用，再把该 JSON 解析为标准的 `tool_calls`。执行方始终是客户端，网关只负责「决定调用什么」的往返。
+
+**请求示例**
+
+```bash
+curl http://localhost:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "v10",
+    "messages": [{"role": "user", "content": "列出当前目录的文件"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "run_terminal",
+        "description": "在用户设备上执行一条 shell 命令",
+        "parameters": {
+          "type": "object",
+          "properties": { "command": { "type": "string" } },
+          "required": ["command"]
+        }
+      }
+    }],
+    "tool_choice": "auto"
+  }'
+```
+
+**响应（模型决定调用工具）**
+
+```json
+{
+  "choices": [{
+    "index": 0,
+    "message": {
+      "role": "assistant",
+      "content": null,
+      "tool_calls": [{
+        "id": "call_...",
+        "type": "function",
+        "function": { "name": "run_terminal", "arguments": "{\"command\":\"ls\"}" }
+      }]
+    },
+    "finish_reason": "tool_calls"
+  }]
+}
+```
+
+**回传工具结果（下一轮）**
+
+```json
+{
+  "model": "v10",
+  "messages": [
+    {"role": "user", "content": "列出当前目录的文件"},
+    {"role": "assistant", "content": null, "tool_calls": [{"id": "call_...", "type": "function", "function": {"name": "run_terminal", "arguments": "{\"command\":\"ls\"}"}}]},
+    {"role": "tool", "tool_call_id": "call_...", "content": "a.txt\nb.txt"}
+  ],
+  "tools": [ ]
+}
+```
+
+**OpenAI SDK 用法**（无需任何改动，`tools` / `tool_calls` 直接可用）
+
+```python
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "run_terminal",
+        "description": "执行 shell 命令",
+        "parameters": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]},
+    },
+}]
+
+resp = client.chat.completions.create(
+    model="v10",
+    messages=[{"role": "user", "content": "列出当前目录"}],
+    tools=tools,
+)
+msg = resp.choices[0].message
+if msg.tool_calls:
+    for tc in msg.tool_calls:
+        print(tc.function.name, tc.function.arguments)  # 由客户端执行
+```
+
+说明：
+
+- `tool_choice` 支持 `auto` / `none` / `required` / 指定函数（`{"type":"function","function":{"name":"..."}}`）。
+- 流式（`stream:true`）同样支持：以 `delta.tool_calls` 分帧下发，`finish_reason` 为 `tool_calls`。
+- 模型是否「愿意」调用工具取决于具体后端；个别后端可能不遵从，换用响应更稳的后端即可。
 
 ## 🌐 可用端点
 
