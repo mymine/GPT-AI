@@ -33,7 +33,7 @@ const PROVIDERS = {
   v11: { name: 'supabase-nano', label: 'Supabase (gpt-5-nano)',    mode: 'prompt' },
   v12: { name: 'airforce',      label: 'api.airforce (llama)',     mode: 'messages', envKey: 'AIRFORCE_API_KEY',   sendModel: true,  model: 'llama-instant' },
   v13: { name: 'supabase-mini', label: 'Supabase (gpt-5-mini)',    mode: 'prompt' },
-  v14: { name: 'chataibot',     label: 'Chataibot',                mode: 'prompt' },
+  v14: { name: 'chataibot',     label: 'Chataibot',                mode: 'prompt', maxInputChars: 2000 },
   v15: { name: 'dopple',       label: 'Dopple AI',                 mode: 'prompt' },
 };
 

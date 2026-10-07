@@ -79,6 +79,22 @@ const PASSTHROUGH = [
   'presence_penalty', 'frequency_penalty', 'stop', 'seed', 'reasoning_effort',
 ];
 
+/**
+ * Cap a folded prompt to `max` chars, keeping the tail (most recent turns) and
+ * preserving the tools instruction at the front when it fits. Used for backends
+ * with an input-length limit (e.g. v14's 2500 chars per message).
+ */
+function capTail(text, max, toolsInstruction) {
+  const s = String(text === null || text === undefined ? '' : text);
+  if (!max || s.length <= max) return s;
+  const note = '…[truncated]';
+  if (toolsInstruction && s.startsWith(toolsInstruction) && toolsInstruction.length + note.length < max) {
+    const tailBudget = Math.max(0, max - toolsInstruction.length - note.length - 1);
+    return `${toolsInstruction}\n${note}${s.slice(-tailBudget)}`;
+  }
+  return note + s.slice(-(max - note.length));
+}
+
 /** Build the payload forwarded to the `/chat/vN` scraper. */
 function buildPayload(provider, body, toolsInstruction) {
   const messages = Array.isArray(body.messages) ? body.messages : [];
@@ -87,7 +103,11 @@ function buildPayload(provider, body, toolsInstruction) {
   if (provider.mode === 'messages') {
     payload.messages = normalizeMessages(messages, toolsInstruction);
   } else {
-    payload.userMessage = flattenMessages(messages, toolsInstruction);
+    let text = flattenMessages(messages, toolsInstruction);
+    // Backends with a hard input limit: keep the tail so the request still
+    // succeeds instead of being rejected for exceeding the limit.
+    if (provider.maxInputChars) text = capTail(text, provider.maxInputChars, toolsInstruction);
+    payload.userMessage = text;
   }
   if (provider.sendModel && provider.model) payload.model = provider.model;
 
